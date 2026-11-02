@@ -1,0 +1,665 @@
+Option Explicit
+
+' AutoCAD Electrical Master Builder V4
+' Main macro: BuildAutoCADElectricalMastersV4
+' Source worksheets are identified by row-1 headers, not worksheet names.
+
+Private Const OUT_COMP As String = "MasterComponentDetails"
+Private Const OUT_CONN As String = "Master_ConnectionDetails"
+Private Const OUT_LOG As String = "AutoCAD_BuildLog"
+
+Public Sub BuildAutoCADElectricalMastersV4()
+    Dim oldCalc As XlCalculation
+    Dim sCmp As Worksheet, sPanel As Worksheet, sBom As Worksheet, sTerm As Worksheet
+    Dim sFromTo As Worksheet, sCableFT As Worksheet, sCableSum As Worksheet
+    Dim cables As Object
+
+    oldCalc = Application.Calculation
+    On Error GoTo Failed
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    DeleteOutput OUT_COMP
+    DeleteOutput OUT_CONN
+    DeleteOutput OUT_LOG
+
+    Set sCmp = FindByHeaders(Array("TAGNAME", "MFG", "CAT", "DESC1"), Array("CMP1"))
+    Set sPanel = FindByHeaders(Array("INST", "LOC", "TAG", "ITEM", "QTY", "CATALOG", "MFG"), Array("TAGNAME"))
+    Set sBom = FindByHeaders(Array("TAG", "QTY", "CATALOG", "MFG", "DESC"), Array("INST", "LOC"))
+    Set sTerm = FindByHeaders(Array("STRIP-ID", "TERM", "WIRENO", "INST", "LOC"), Array("CMP1"))
+
+    ' Exact signature supplied for the AutoCAD Electrical From/To report.
+    Set sFromTo = FindByHeaders(Array( _
+        "INST1", "EMLOC1", "LOC1", "SH1", "REF1", "CMP1", "PIN1", _
+        "CMP:PIN1", "DESC11", "DESC21", "ADDRESS1", "FUNC_DESC1", _
+        "WLAY1", "WIRENUM1", "WIRENO", "INST2", "EMLOC2", "LOC2", _
+        "SH2", "REF2", "CMP2", "PIN2", "CMP:PIN2", "DESC12", _
+        "DESC22", "ADDRESS2", "FUNC_DESC2", "WLAY2", "WIRENUM2"), _
+        Array("CBLCAT", "CBLMFG"))
+
+    Set sCableFT = FindByHeaders(Array( _
+        "CBL", "WLAY1", "CMP:PIN1", "CMP:PIN2", "CMP1", "PIN1", _
+        "LOC1", "CMP2", "PIN2", "LOC2"), Array("DESC11", "FUNC_DESC1"))
+
+    Set sCableSum = FindByHeaders(Array( _
+        "CBL", "MFG", "CAT", "REF", "DESC1", "DESC2", "DESC3"), _
+        Array("CMP1", "PIN1"))
+
+    WriteBuildLog sCmp, sPanel, sBom, sTerm, sFromTo, sCableFT, sCableSum
+
+    If sCmp Is Nothing And sPanel Is Nothing And sBom Is Nothing And sTerm Is Nothing Then
+        Err.Raise vbObjectError + 400, , "No component-related report was found."
+    End If
+    If sFromTo Is Nothing And sCableFT Is Nothing Then
+        Err.Raise vbObjectError + 401, , "No From/To or Cable From/To report was found."
+    End If
+
+    Set cables = CreateObject("Scripting.Dictionary")
+    cables.CompareMode = vbTextCompare
+    If Not sCableSum Is Nothing Then LoadCableSummary cables, sCableSum
+
+    BuildComponentsV4 sCmp, sPanel, sBom, sTerm, cables
+    BuildConnectionsV4 sFromTo, sCableFT, cables
+
+    FormatOutput ThisWorkbook.Worksheets(OUT_COMP)
+    FormatOutput ThisWorkbook.Worksheets(OUT_CONN)
+    MsgBox "Version 4 rebuilt the consolidated component and connection sheets.", vbInformation
+
+Finished:
+    Application.Calculation = oldCalc
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+Failed:
+    MsgBox "Version 4 stopped: " & Err.Description, vbCritical
+    Resume Finished
+End Sub
+
+'============================== DISCOVERY ==============================
+
+Private Function FindByHeaders(ByVal required As Variant, ByVal forbidden As Variant) As Worksheet
+    Dim ws As Worksheet, hm As Object, h As Variant, ok As Boolean
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name <> OUT_COMP And ws.Name <> OUT_CONN And ws.Name <> OUT_LOG Then
+            Set hm = HeaderMap(ws)
+            ok = (hm.Count > 0)
+            If ok Then
+                For Each h In required
+                    If Not hm.Exists(NormalHeader(CStr(h))) Then ok = False: Exit For
+                Next h
+            End If
+            If ok Then
+                For Each h In forbidden
+                    If hm.Exists(NormalHeader(CStr(h))) Then ok = False: Exit For
+                Next h
+            End If
+            If ok Then Set FindByHeaders = ws: Exit Function
+        End If
+    Next ws
+End Function
+
+Private Function HeaderMap(ByVal ws As Worksheet) As Object
+    Dim d As Object, c As Long, lastCol As Long, key As String
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = vbTextCompare
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        key = NormalHeader(CStr(ws.Cells(1, c).Value2))
+        If Len(key) > 0 And Not d.Exists(key) Then d.Add key, c
+    Next c
+    Set HeaderMap = d
+End Function
+
+Private Function NormalHeader(ByVal value As String) As String
+    value = UCase$(Trim$(Replace(Replace(value, vbCr, " "), vbLf, " ")))
+    Do While InStr(value, "  ") > 0: value = Replace(value, "  ", " "): Loop
+    NormalHeader = value
+End Function
+
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Cells.Find("*", ws.Cells(1, 1), xlFormulas, xlPart, xlByRows, xlPrevious)
+    If f Is Nothing Then LastDataRow = 1 Else LastDataRow = f.Row
+End Function
+
+Private Function FieldText(ByVal ws As Worksheet, ByVal hm As Object, _
+                           ByVal rowNo As Long, ByVal headerName As String) As String
+    Dim key As String, cell As Range, raw As Variant
+    key = NormalHeader(headerName)
+    If Not hm.Exists(key) Then Exit Function
+    Set cell = ws.Cells(rowNo, hm(key))
+    raw = cell.Value2
+    If IsError(raw) Or IsEmpty(raw) Then Exit Function
+    FieldText = Trim$(CStr(raw))
+End Function
+
+Private Function Norm(ByVal value As String) As String
+    Norm = UCase$(Trim$(value))
+End Function
+
+Private Function CleanPin(ByVal value As String) As String
+    value = Trim$(value)
+    If Len(value) >= 3 Then
+        If UCase$(Right$(value, 3)) = ": I" Or UCase$(Right$(value, 3)) = ": E" Then
+            value = Left$(value, Len(value) - 3)
+        End If
+    End If
+    CleanPin = Trim$(value)
+End Function
+
+Private Function EndpointPin(ByVal ws As Worksheet, ByVal hm As Object, _
+                             ByVal rowNo As Long, ByVal pinHeader As String, _
+                             ByVal combinedHeader As String) As String
+    Dim combined As String, p As Long, key As String, cell As Range
+
+    ' Preferred source: CMP:PIN remains textual even when Excel converts PIN to a date.
+    combined = FieldText(ws, hm, rowNo, combinedHeader)
+    p = InStrRev(combined, ":")
+    If p > 0 And p < Len(combined) Then
+        EndpointPin = CleanPin(Mid$(combined, p + 1))
+        Exit Function
+    End If
+
+    ' Fallback for a date-converted PIN cell, for example 4-Feb -> 2-4.
+    key = NormalHeader(pinHeader)
+    If hm.Exists(key) Then
+        Set cell = ws.Cells(rowNo, hm(key))
+        If IsDate(cell.value) Then
+            EndpointPin = CStr(Month(CDate(cell.value))) & "-" & CStr(Day(CDate(cell.value)))
+            Exit Function
+        End If
+    End If
+
+    EndpointPin = CleanPin(FieldText(ws, hm, rowNo, pinHeader))
+End Function
+
+'============================== CABLES ==============================
+
+Private Sub LoadCableSummary(ByVal cables As Object, ByVal ws As Worksheet)
+    Dim hm As Object, r As Long, cableID As String, rec As Variant
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        cableID = FieldText(ws, hm, r, "CBL")
+        If Len(cableID) > 0 Then
+            rec = Array( _
+                FieldText(ws, hm, r, "MFG"), _
+                FieldText(ws, hm, r, "CAT"), _
+                FieldText(ws, hm, r, "REF"), _
+                FieldText(ws, hm, r, "DESC1"), _
+                FieldText(ws, hm, r, "DESC2"), _
+                FieldText(ws, hm, r, "DESC3"))
+            cables(Norm(cableID)) = rec
+        End If
+    Next r
+End Sub
+
+'============================== COMPONENTS ==============================
+
+Private Sub BuildComponentsV4(ByVal sCmp As Worksheet, ByVal sPanel As Worksheet, _
+                              ByVal sBom As Worksheet, ByVal sTerm As Worksheet, _
+                              ByVal cables As Object)
+    Dim out As Worksheet, devices As Object, terminals As Object
+    Dim key As Variant, outRow As Long
+
+    Set out = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    out.Name = OUT_COMP
+    WriteHeaders out, Array( _
+        "Component Status", "Tag", "Manufacturer", "Catalog Number", _
+        "Additional Catalogs", "Description 1", "Terminal Strip", _
+        "Item Number", "Assembly Code", "Category", "Rating 1", "Rating 2", _
+        "Terminal Number", "Description 2", "Description 3", _
+        "Installation", "Location", "Source Reports", "Audit Note")
+
+    Set devices = CreateObject("Scripting.Dictionary")
+    devices.CompareMode = vbTextCompare
+    Set terminals = CreateObject("Scripting.Dictionary")
+    terminals.CompareMode = vbTextCompare
+
+    ' Priority order makes the schematic catalog the primary catalog.
+    If Not sCmp Is Nothing Then LoadCMPDevices devices, sCmp
+    If Not sPanel Is Nothing Then LoadPanelDevices devices, sPanel
+    If Not sBom Is Nothing Then LoadBOMDevices devices, sBom
+    If Not sTerm Is Nothing Then LoadTerminalRows terminals, sTerm, sPanel
+    LoadCableDevices devices, cables
+
+    outRow = 2
+    For Each key In devices.Keys
+        out.Cells(outRow, 1).Resize(1, 19).value = devices(key)
+        outRow = outRow + 1
+    Next key
+    For Each key In terminals.Keys
+        out.Cells(outRow, 1).Resize(1, 19).value = terminals(key)
+        outRow = outRow + 1
+    Next key
+End Sub
+
+Private Function BlankComponent() As Variant
+    Dim rec(1 To 1, 1 To 19) As Variant
+    BlankComponent = rec
+End Function
+
+Private Function DeviceKey(ByVal tag As String) As String
+    DeviceKey = "D|" & Norm(tag)
+End Function
+
+Private Function TerminalKey(ByVal inst As String, ByVal loc As String, _
+                             ByVal stripID As String, ByVal termNo As String) As String
+    TerminalKey = "T|" & Norm(inst) & "|" & Norm(loc) & "|" & _
+                  Norm(stripID) & "|" & Norm(termNo)
+End Function
+
+Private Sub MergeDevice(ByVal devices As Object, ByVal tag As String, _
+                        ByVal incoming As Variant, ByVal sourceName As String)
+    Dim key As String, current As Variant, i As Long, incomingCat As String
+    key = DeviceKey(tag)
+    If Len(tag) = 0 Then Exit Sub
+
+    If Not devices.Exists(key) Then
+        incoming(1, 18) = sourceName
+        devices.Add key, incoming
+        Exit Sub
+    End If
+
+    current = devices(key)
+    incomingCat = Trim$(CStr(incoming(1, 4)))
+    If Len(CStr(current(1, 4))) = 0 Then
+        current(1, 4) = incomingCat
+    ElseIf Len(incomingCat) > 0 And _
+           StrComp(CStr(current(1, 4)), incomingCat, vbTextCompare) <> 0 Then
+        current(1, 5) = AppendUnique(CStr(current(1, 5)), incomingCat)
+    End If
+
+    For i = 1 To 17
+        If i <> 4 And i <> 5 Then
+            If Len(CStr(current(1, i))) = 0 And Len(CStr(incoming(1, i))) > 0 Then
+                current(1, i) = incoming(1, i)
+            End If
+        End If
+    Next i
+
+    If Len(CStr(incoming(1, 16))) > 0 And Len(CStr(current(1, 16))) > 0 Then
+        If StrComp(CStr(incoming(1, 16)), CStr(current(1, 16)), vbTextCompare) <> 0 Then
+            current(1, 19) = AppendNote(CStr(current(1, 19)), "Conflicting installation for same tag")
+        End If
+    End If
+    If Len(CStr(incoming(1, 17))) > 0 And Len(CStr(current(1, 17))) > 0 Then
+        If StrComp(CStr(incoming(1, 17)), CStr(current(1, 17)), vbTextCompare) <> 0 Then
+            current(1, 19) = AppendNote(CStr(current(1, 19)), "Conflicting location for same tag")
+        End If
+    End If
+
+    current(1, 18) = AppendSource(CStr(current(1, 18)), sourceName)
+    devices(key) = current
+End Sub
+
+Private Sub LoadCMPDevices(ByVal devices As Object, ByVal ws As Worksheet)
+    Dim hm As Object, r As Long, rec As Variant, tag As String
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        tag = FieldText(ws, hm, r, "TAGNAME")
+        If Len(tag) > 0 Then
+            rec = BlankComponent()
+            rec(1, 1) = "Electrical Only": rec(1, 2) = tag
+            rec(1, 3) = FieldText(ws, hm, r, "MFG")
+            rec(1, 4) = FieldText(ws, hm, r, "CAT")
+            rec(1, 6) = FieldText(ws, hm, r, "DESC1")
+            rec(1, 10) = FieldText(ws, hm, r, "CATEGORY")
+            rec(1, 11) = FieldText(ws, hm, r, "RATING1")
+            rec(1, 12) = FieldText(ws, hm, r, "RATING2")
+            rec(1, 14) = FieldText(ws, hm, r, "DESC2")
+            rec(1, 15) = FieldText(ws, hm, r, "DESC3")
+            rec(1, 16) = FieldText(ws, hm, r, "INST")
+            rec(1, 17) = FieldText(ws, hm, r, "LOC")
+            MergeDevice devices, tag, rec, "Component"
+        End If
+    Next r
+End Sub
+
+Private Sub LoadPanelDevices(ByVal devices As Object, ByVal ws As Worksheet)
+    Dim hm As Object, r As Long, rec As Variant, tag As String
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        tag = FieldText(ws, hm, r, "TAG")
+        If Len(tag) > 0 Then
+            rec = BlankComponent()
+            rec(1, 1) = "Electrical Only": rec(1, 2) = tag
+            rec(1, 3) = FieldText(ws, hm, r, "MFG")
+            rec(1, 4) = FieldText(ws, hm, r, "CATALOG")
+            rec(1, 6) = FieldText(ws, hm, r, "DESC")
+            rec(1, 8) = FieldText(ws, hm, r, "ITEM")
+            rec(1, 9) = FieldText(ws, hm, r, "ASSYCODE")
+            rec(1, 14) = FieldText(ws, hm, r, "DESC2")
+            rec(1, 15) = FieldText(ws, hm, r, "DESC3")
+            rec(1, 16) = FieldText(ws, hm, r, "INST")
+            rec(1, 17) = FieldText(ws, hm, r, "LOC")
+            MergeDevice devices, tag, rec, "Panel Component"
+        End If
+    Next r
+End Sub
+
+Private Sub LoadBOMDevices(ByVal devices As Object, ByVal ws As Worksheet)
+    Dim hm As Object, r As Long, rec As Variant, tag As String
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        tag = FieldText(ws, hm, r, "TAG")
+        If Len(tag) > 0 Then
+            rec = BlankComponent()
+            rec(1, 1) = "Electrical Only": rec(1, 2) = tag
+            rec(1, 3) = FieldText(ws, hm, r, "MFG")
+            rec(1, 4) = FieldText(ws, hm, r, "CATALOG")
+            rec(1, 6) = FieldText(ws, hm, r, "DESC")
+            rec(1, 10) = FieldText(ws, hm, r, "QUERY2")
+            rec(1, 11) = FieldText(ws, hm, r, "MISC1")
+            rec(1, 12) = FieldText(ws, hm, r, "MISC2")
+            MergeDevice devices, tag, rec, "BOM"
+        End If
+    Next r
+End Sub
+
+Private Sub LoadTerminalRows(ByVal terminals As Object, ByVal ws As Worksheet, _
+                             ByVal panelWS As Worksheet)
+    Dim hm As Object, r As Long, rec As Variant, key As String
+    Dim stripID As String, termNo As String, inst As String, loc As String
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        stripID = FieldText(ws, hm, r, "STRIP-ID")
+        termNo = FieldText(ws, hm, r, "TERM")
+        inst = FieldText(ws, hm, r, "INST")
+        loc = FieldText(ws, hm, r, "LOC")
+        If Len(stripID & termNo) > 0 Then
+            key = TerminalKey(inst, loc, stripID, termNo)
+            If Not terminals.Exists(key) Then
+                rec = BlankComponent()
+                rec(1, 1) = "Electrical Only"
+                rec(1, 7) = stripID
+                rec(1, 10) = "TRMS"
+                rec(1, 13) = termNo
+                rec(1, 16) = inst
+                rec(1, 17) = loc
+                rec(1, 18) = "Terminal Numbers"
+                FillTerminalCatalog rec, stripID, loc, panelWS
+                terminals.Add key, rec
+            End If
+        End If
+    Next r
+End Sub
+
+Private Sub FillTerminalCatalog(ByRef rec As Variant, ByVal stripID As String, _
+                                ByVal loc As String, ByVal panelWS As Worksheet)
+    Dim hm As Object, r As Long
+    If panelWS Is Nothing Then Exit Sub
+    Set hm = HeaderMap(panelWS)
+    For r = 2 To LastDataRow(panelWS)
+        If Norm(FieldText(panelWS, hm, r, "TAG")) = Norm(stripID) And _
+           Norm(FieldText(panelWS, hm, r, "LOC")) = Norm(loc) Then
+            If Len(FieldText(panelWS, hm, r, "CATALOG")) > 0 Then
+                rec(1, 3) = FieldText(panelWS, hm, r, "MFG")
+                rec(1, 4) = FieldText(panelWS, hm, r, "CATALOG")
+                rec(1, 6) = FieldText(panelWS, hm, r, "DESC")
+                rec(1, 8) = FieldText(panelWS, hm, r, "ITEM")
+                Exit Sub
+            End If
+        End If
+    Next r
+End Sub
+
+Private Sub LoadCableDevices(ByVal devices As Object, ByVal cables As Object)
+    Dim key As Variant, c As Variant, rec As Variant
+    For Each key In cables.Keys
+        c = cables(key): rec = BlankComponent()
+        rec(1, 1) = "Electrical Only Cables"
+        rec(1, 2) = CStr(key)
+        rec(1, 3) = c(0): rec(1, 4) = c(1)
+        rec(1, 6) = c(3): rec(1, 10) = "CABLE"
+        rec(1, 14) = c(4): rec(1, 15) = c(5)
+        MergeDevice devices, CStr(key), rec, "Cable Summary"
+    Next key
+End Sub
+
+'============================== CONNECTIONS ==============================
+
+Private Sub BuildConnectionsV4(ByVal sFromTo As Worksheet, _
+                               ByVal sCableFT As Worksheet, ByVal cables As Object)
+    Dim out As Worksheet, connections As Object, key As Variant, outRow As Long
+    Set out = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    out.Name = OUT_CONN
+    WriteHeaders out, Array( _
+        "Component Status", "Wire Number", "From Installation", "From Location", _
+        "From Component", "From Pin", "To Installation", "To Location", _
+        "To Component", "To Pin", "Cable Installation", "Cable Location", _
+        "Wire Type", "Wire Color", "Wire Gauge", "Cable", _
+        "Cable Manufacturer", "Cable Catalog", "Cable Reference", _
+        "Connection Class", "Source Reports", "Audit Note")
+
+    Set connections = CreateObject("Scripting.Dictionary")
+    connections.CompareMode = vbTextCompare
+    If Not sFromTo Is Nothing Then LoadFromToRows connections, sFromTo
+    If Not sCableFT Is Nothing Then LoadCableRows connections, sCableFT, cables
+
+    outRow = 2
+    For Each key In connections.Keys
+        out.Cells(outRow, 1).Resize(1, 22).value = connections(key)
+        outRow = outRow + 1
+    Next key
+End Sub
+
+Private Function BlankConnection() As Variant
+    Dim rec(1 To 1, 1 To 22) As Variant
+    BlankConnection = rec
+End Function
+
+Private Function EndpointKey(ByVal loc As String, ByVal cmp As String, ByVal pin As String) As String
+    EndpointKey = Norm(loc) & "|" & Norm(cmp) & "|" & Norm(CleanPin(pin))
+End Function
+
+Private Function ConnectionKey(ByVal rec As Variant) As String
+    Dim a As String, b As String, t As String
+    a = EndpointKey(CStr(rec(1, 4)), CStr(rec(1, 5)), CStr(rec(1, 6)))
+    b = EndpointKey(CStr(rec(1, 8)), CStr(rec(1, 9)), CStr(rec(1, 10)))
+    If a > b Then t = a: a = b: b = t
+    ConnectionKey = a & "<>" & b & "|" & Norm(CStr(rec(1, 2)))
+End Function
+
+Private Sub MergeConnection(ByVal connections As Object, ByVal rec As Variant, _
+                            ByVal sourceName As String)
+    Dim key As String, current As Variant, i As Long
+    key = ConnectionKey(rec)
+    If Not connections.Exists(key) Then
+        rec(1, 21) = sourceName
+        connections.Add key, rec
+        Exit Sub
+    End If
+    current = connections(key)
+    For i = 1 To 20
+        If Len(CStr(current(1, i))) = 0 And Len(CStr(rec(1, i))) > 0 Then
+            current(1, i) = rec(1, i)
+        End If
+    Next i
+    current(1, 21) = AppendSource(CStr(current(1, 21)), sourceName)
+    If Len(CStr(rec(1, 22))) > 0 Then
+        current(1, 22) = AppendNote(CStr(current(1, 22)), CStr(rec(1, 22)))
+    End If
+    connections(key) = current
+End Sub
+
+Private Sub LoadFromToRows(ByVal connections As Object, ByVal ws As Worksheet)
+    Dim hm As Object, r As Long, rec As Variant, wireType As String
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        rec = BlankConnection()
+        wireType = FieldText(ws, hm, r, "WLAY1")
+        If Len(wireType) = 0 Then wireType = FieldText(ws, hm, r, "WLAY2")
+        rec(1, 1) = StatusFromType(wireType)
+        rec(1, 2) = FieldText(ws, hm, r, "WIRENO")
+        rec(1, 3) = FieldText(ws, hm, r, "INST1")
+        rec(1, 4) = FieldText(ws, hm, r, "LOC1")
+        rec(1, 5) = FieldText(ws, hm, r, "CMP1")
+        rec(1, 6) = EndpointPin(ws, hm, r, "PIN1", "CMP:PIN1")
+        rec(1, 7) = FieldText(ws, hm, r, "INST2")
+        rec(1, 8) = FieldText(ws, hm, r, "LOC2")
+        rec(1, 9) = FieldText(ws, hm, r, "CMP2")
+        rec(1, 10) = EndpointPin(ws, hm, r, "PIN2", "CMP:PIN2")
+        rec(1, 13) = wireType
+        SplitWireType wireType, rec(1, 14), rec(1, 15)
+        rec(1, 20) = ConnectionClass(wireType)
+        MergeConnection connections, rec, "From/To"
+    Next r
+End Sub
+
+Private Sub LoadCableRows(ByVal connections As Object, ByVal ws As Worksheet, _
+                          ByVal cables As Object)
+    Dim hm As Object, r As Long, rec As Variant, cableID As String
+    Dim wireType As String, cableRec As Variant
+    Set hm = HeaderMap(ws)
+    For r = 2 To LastDataRow(ws)
+        rec = BlankConnection()
+        cableID = FieldText(ws, hm, r, "CBL")
+        wireType = FieldText(ws, hm, r, "WLAY1")
+        rec(1, 1) = "Electrical Only Cables"
+        rec(1, 2) = FieldText(ws, hm, r, "WIRENO")
+        rec(1, 3) = FieldText(ws, hm, r, "INST1")
+        rec(1, 4) = FieldText(ws, hm, r, "LOC1")
+        rec(1, 5) = FieldText(ws, hm, r, "CMP1")
+        rec(1, 6) = EndpointPin(ws, hm, r, "PIN1", "CMP:PIN1")
+        rec(1, 7) = FieldText(ws, hm, r, "INST2")
+        rec(1, 8) = FieldText(ws, hm, r, "LOC2")
+        rec(1, 9) = FieldText(ws, hm, r, "CMP2")
+        rec(1, 10) = EndpointPin(ws, hm, r, "PIN2", "CMP:PIN2")
+        rec(1, 13) = wireType: rec(1, 16) = cableID
+        SplitWireType wireType, rec(1, 14), rec(1, 15)
+        rec(1, 20) = ConnectionClass(wireType)
+        If cables.Exists(Norm(cableID)) Then
+            cableRec = cables(Norm(cableID))
+            rec(1, 17) = cableRec(0): rec(1, 18) = cableRec(1): rec(1, 19) = cableRec(2)
+        ElseIf Len(cableID) > 0 Then
+            rec(1, 22) = "Cable is not listed in Cable Summary"
+        End If
+        If Len(CStr(rec(1, 5))) = 0 Or CStr(rec(1, 5)) = "(??)" Or _
+           Len(CStr(rec(1, 9))) = 0 Or CStr(rec(1, 9)) = "(??)" Then
+            rec(1, 22) = AppendNote(CStr(rec(1, 22)), _
+                "Incomplete shield/cable endpoint; known endpoint preserved")
+        End If
+        MergeConnection connections, rec, "Cable From/To"
+    Next r
+End Sub
+
+Private Function StatusFromType(ByVal wireType As String) As String
+    If Norm(wireType) = "_CABLE" Or InStr(1, Norm(wireType), "SHLD", vbTextCompare) > 0 Then
+        StatusFromType = "Electrical Only Cables"
+    Else
+        StatusFromType = "Electrical Only"
+    End If
+End Function
+
+Private Function ConnectionClass(ByVal wireType As String) As String
+    Select Case Norm(wireType)
+        Case "_BUS": ConnectionClass = "Bus"
+        Case "_PIN": ConnectionClass = "Internal Pin"
+        Case "_CABLE": ConnectionClass = "Cable"
+        Case "_ETHERNET": ConnectionClass = "Network"
+        Case "FACT_PREWIRE": ConnectionClass = "Factory Prewire"
+        Case Else
+            If InStr(1, Norm(wireType), "SHLD", vbTextCompare) > 0 Then
+                ConnectionClass = "Shield"
+            Else
+                ConnectionClass = "Physical Wire"
+            End If
+    End Select
+End Function
+
+Private Sub SplitWireType(ByVal wireType As String, ByRef color As Variant, ByRef gauge As Variant)
+    Dim p As Long
+    p = InStrRev(wireType, "_")
+    If p > 1 And Left$(wireType, 1) <> "_" Then
+        color = Left$(wireType, p - 1)
+        gauge = Mid$(wireType, p + 1)
+    End If
+End Sub
+
+'============================== HELPERS ==============================
+
+Private Function AppendUnique(ByVal existing As String, ByVal value As String) As String
+    Dim item As Variant
+    For Each item In Split(existing, ";")
+        If StrComp(Trim$(CStr(item)), Trim$(value), vbTextCompare) = 0 Then
+            AppendUnique = existing: Exit Function
+        End If
+    Next item
+    If Len(existing) = 0 Then AppendUnique = value Else AppendUnique = existing & "; " & value
+End Function
+
+Private Function AppendSource(ByVal existing As String, ByVal value As String) As String
+    If Len(existing) = 0 Then
+        AppendSource = value
+    ElseIf InStr(1, existing, value, vbTextCompare) = 0 Then
+        AppendSource = existing & "; " & value
+    Else
+        AppendSource = existing
+    End If
+End Function
+
+Private Function AppendNote(ByVal existing As String, ByVal value As String) As String
+    If Len(value) = 0 Then AppendNote = existing: Exit Function
+    If Len(existing) = 0 Then
+        AppendNote = value
+    ElseIf InStr(1, existing, value, vbTextCompare) = 0 Then
+        AppendNote = existing & "; " & value
+    Else
+        AppendNote = existing
+    End If
+End Function
+
+Private Sub WriteHeaders(ByVal ws As Worksheet, ByVal headers As Variant)
+    Dim i As Long
+    For i = LBound(headers) To UBound(headers)
+        ws.Cells(1, i + 1).value = headers(i)
+    Next i
+End Sub
+
+Private Sub FormatOutput(ByVal ws As Worksheet)
+    With ws
+        .Cells.NumberFormat = "@"
+        .Rows(1).Font.Bold = True
+        .Rows(1).Interior.color = RGB(31, 78, 121)
+        .Rows(1).Font.color = vbWhite
+        .Rows(1).WrapText = True
+        .Rows(1).AutoFilter
+        .Cells.EntireColumn.AutoFit
+        .Activate
+    End With
+    ActiveWindow.SplitRow = 1
+    ActiveWindow.FreezePanes = True
+End Sub
+
+Private Sub WriteBuildLog(ByVal a As Worksheet, ByVal b As Worksheet, _
+                          ByVal c As Worksheet, ByVal d As Worksheet, _
+                          ByVal e As Worksheet, ByVal f As Worksheet, _
+                          ByVal g As Worksheet)
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    ws.Name = OUT_LOG
+    ws.Cells(1, 1) = "Report Signature": ws.Cells(1, 2) = "Recognized Worksheet"
+    LogRow ws, 2, "Component", a
+    LogRow ws, 3, "Panel Component", b
+    LogRow ws, 4, "BOM", c
+    LogRow ws, 5, "Terminal Numbers", d
+    LogRow ws, 6, "From/To", e
+    LogRow ws, 7, "Cable From/To", f
+    LogRow ws, 8, "Cable Summary", g
+    ws.Rows(1).Font.Bold = True: ws.Columns("A:B").AutoFit
+End Sub
+
+Private Sub LogRow(ByVal ws As Worksheet, ByVal rowNo As Long, _
+                   ByVal reportName As String, ByVal sourceSheet As Worksheet)
+    ws.Cells(rowNo, 1) = reportName
+    If sourceSheet Is Nothing Then ws.Cells(rowNo, 2) = "Not found" Else ws.Cells(rowNo, 2) = sourceSheet.Name
+End Sub
+
+Private Sub DeleteOutput(ByVal sheetName As String)
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    ThisWorkbook.Worksheets(sheetName).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+End Sub

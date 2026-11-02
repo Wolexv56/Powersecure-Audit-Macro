@@ -1,0 +1,276 @@
+Option Explicit
+
+' Clean standalone audit. No module constants and no generic procedure names.
+' Required sheets: MasterComponentDetails and Master_ConnectionDetails
+
+Public Sub AEC2RunAudit()
+    Dim wsC As Worksheet, wsN As Worksheet, wsR As Worksheet, wsConfig As Worksheet
+    Dim oldCalc As XlCalculation
+    oldCalc = Application.Calculation
+    On Error GoTo Failed
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    Set wsC = AEC2Sheet("MasterComponentDetails")
+    Set wsN = AEC2Sheet("Master_ConnectionDetails")
+    If wsC Is Nothing Then Err.Raise vbObjectError + 2101, , "MasterComponentDetails was not found."
+    If wsN Is Nothing Then Err.Raise vbObjectError + 2102, , "Master_ConnectionDetails was not found."
+
+    Set wsConfig = AEC2Config()
+    Set wsR = AEC2Results()
+    AEC2Headers wsR
+
+    AEC2WireNoConnection wsN, wsR
+    AEC2WireExceptions wsN, wsR
+    AEC2CableExceptions wsC, wsN, wsR
+    AEC2NoCatalog wsC, wsR
+    AEC2ComponentDuplicates wsC, wsR, UCase$(Trim$(CStr(wsConfig.Range("B2").Value2)))
+    AEC2NoComponentConnection wsC, wsN, wsR
+    AEC2Add wsR, "Mixed Component Network", "INFO", "LIMITED", msg:="WDTYPE comparison is unavailable.", basis:="The two master sheets do not contain WDTYPE."
+    AEC2TerminalDuplicates wsC, wsR
+    AEC2PinExceptions wsN, wsR
+    AEC2Add wsR, "Contacts", "INFO", "LIMITED", msg:="Orphan child contacts cannot be determined.", basis:="The two master sheets do not contain parent-child symbol links."
+
+    AEC2Format wsR
+    MsgBox "AEAUDIT completed. Review AEAudit_Results.", vbInformation
+Done:
+    Application.Calculation = oldCalc
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+Failed:
+    MsgBox "AEAUDIT stopped: " & Err.Description, vbCritical
+    Resume Done
+End Sub
+
+Private Function AEC2Sheet(ByVal n As String) As Worksheet
+    On Error Resume Next
+    Set AEC2Sheet = ThisWorkbook.Worksheets(n)
+    On Error GoTo 0
+End Function
+
+Private Function AEC2Config() As Worksheet
+    Dim ws As Worksheet
+    Set ws = AEC2Sheet("AEAudit_Config")
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+        ws.Name = "AEAudit_Config"
+        ws.Range("A1:B3").value = Array(Array("Setting", "Value"), Array("Component duplicate mode", "STANDARD"), Array("Allowed values", "STANDARD or INST_LOC"))
+        ws.Columns("A:B").AutoFit
+    End If
+    Set AEC2Config = ws
+End Function
+
+Private Function AEC2Results() As Worksheet
+    Dim ws As Worksheet
+    Set ws = AEC2Sheet("AEAudit_Results")
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = "AEAudit_Results"
+    Else
+        ws.Cells.Clear
+    End If
+    Set AEC2Results = ws
+End Function
+
+Private Sub AEC2Headers(ByVal ws As Worksheet)
+    Dim a As Variant, i As Long
+    a = Array("Check", "Severity", "Result", "Wire Number", "Cable Tag", "Wire Color/Gauge", "Component Tag", "Category/Class", "Terminal Strip", "Terminal Number", "Pin", "Installation", "Location", "Reference", "Drawing", "Error Message", "Basis / Limitation")
+    For i = 0 To UBound(a): ws.Cells(1, i + 1).value = a(i): Next i
+End Sub
+
+Private Sub AEC2Add(ByVal ws As Worksheet, ByVal chk As String, ByVal sev As String, ByVal res As String, _
+ Optional ByVal wire As String = "", Optional ByVal cable As String = "", Optional ByVal style As String = "", _
+ Optional ByVal tag As String = "", Optional ByVal cat As String = "", Optional ByVal strip As String = "", _
+ Optional ByVal term As String = "", Optional ByVal pin As String = "", Optional ByVal inst As String = "", _
+ Optional ByVal loc As String = "", Optional ByVal ref As String = "", Optional ByVal drawing As String = "", _
+ Optional ByVal msg As String = "", Optional ByVal basis As String = "")
+    Dim r As Long
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Resize(1, 17).value = Array(chk, sev, res, wire, cable, style, tag, cat, strip, term, pin, inst, loc, ref, drawing, msg, basis)
+End Sub
+
+Private Function AEC2Col(ByVal ws As Worksheet, ByVal h As String) As Long
+    Dim c As Long, lastC As Long
+    lastC = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastC
+        If StrComp(Trim$(CStr(ws.Cells(1, c).Value2)), Trim$(h), vbTextCompare) = 0 Then AEC2Col = c: Exit Function
+    Next c
+End Function
+
+Private Function AEC2Text(ByVal ws As Worksheet, ByVal r As Long, ByVal h As String) As String
+    Dim c As Long, v As Variant
+    c = AEC2Col(ws, h): If c = 0 Then Exit Function
+    v = ws.Cells(r, c).Value2
+    If Not IsError(v) And Not IsEmpty(v) Then AEC2Text = Trim$(CStr(v))
+End Function
+
+Private Function AEC2Last(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Cells.Find("*", ws.Cells(1, 1), xlFormulas, xlPart, xlByRows, xlPrevious)
+    If f Is Nothing Then AEC2Last = 1 Else AEC2Last = f.Row
+End Function
+
+Private Function AEC2Unknown(ByVal s As String) As Boolean
+    s = UCase$(Trim$(s))
+    AEC2Unknown = (s = "" Or s = "(??)" Or s = "??" Or s = "?")
+End Function
+
+Private Function AEC2Endpoint(ByVal inst As String, ByVal loc As String, ByVal tag As String, ByVal pin As String) As String
+    AEC2Endpoint = UCase$(Trim$(inst) & "|" & Trim$(loc) & "|" & Trim$(tag) & "|" & Trim$(pin))
+End Function
+
+Private Function AEC2Pair(ByVal a As String, ByVal b As String) As String
+    If StrComp(a, b, vbTextCompare) <= 0 Then AEC2Pair = a & "<>" & b Else AEC2Pair = b & "<>" & a
+End Function
+
+Private Function AEC2Terminal(ByVal ws As Worksheet, ByVal r As Long) As Boolean
+    AEC2Terminal = (UCase$(AEC2Text(ws, r, "Category")) = "TRMS" Or (AEC2Text(ws, r, "Terminal Strip") <> "" And AEC2Text(ws, r, "Terminal Number") <> ""))
+End Function
+
+Private Sub AEC2WireNoConnection(ByVal ws As Worksheet, ByVal out As Worksheet)
+    Dim r As Long, a As String, b As String
+    For r = 2 To AEC2Last(ws)
+        a = AEC2Text(ws, r, "From Component"): b = AEC2Text(ws, r, "To Component")
+        If AEC2Unknown(a) Xor AEC2Unknown(b) Then
+            AEC2Add out, "Wire - No Connection", "ERROR", "FLAG", wire:=AEC2Text(ws, r, "Wire Number"), cable:=AEC2Text(ws, r, "Cable"), style:=AEC2Text(ws, r, "Wire Type"), msg:="One endpoint is blank or unknown.", basis:="Report-based loose-end proxy; drawing coordinates are unavailable."
+        End If
+    Next r
+End Sub
+
+Private Sub AEC2WireExceptions(ByVal ws As Worksheet, ByVal out As Worksheet)
+    Dim d As Object, pairs As Object, r As Long, w As String, a As String, b As String, k As Variant
+    Set d = CreateObject("Scripting.Dictionary"): d.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(ws)
+        w = AEC2Text(ws, r, "Wire Number")
+        a = AEC2Endpoint(AEC2Text(ws, r, "From Installation"), AEC2Text(ws, r, "From Location"), AEC2Text(ws, r, "From Component"), AEC2Text(ws, r, "From Pin"))
+        b = AEC2Endpoint(AEC2Text(ws, r, "To Installation"), AEC2Text(ws, r, "To Location"), AEC2Text(ws, r, "To Component"), AEC2Text(ws, r, "To Pin"))
+        If w = "" Then
+            If Not (AEC2Unknown(AEC2Text(ws, r, "From Component")) And AEC2Unknown(AEC2Text(ws, r, "To Component"))) Then AEC2Add out, "Wire Exception", "ERROR", "FLAG", msg:="Connection has no wire number.", basis:="Direct blank Wire Number test."
+        Else
+            If Not d.Exists(w) Then Set pairs = CreateObject("Scripting.Dictionary"): pairs.CompareMode = vbTextCompare: d.Add w, pairs
+            d(w)(AEC2Pair(a, b)) = True
+        End If
+    Next r
+    For Each k In d.Keys
+        If d(k).Count > 1 Then AEC2Add out, "Wire Exception", "WARNING", "POSSIBLE", wire:=CStr(k), msg:="Wire number occurs on multiple endpoint pairs.", basis:="May be a valid multi-drop network; drawing topology is required."
+    Next k
+End Sub
+
+Private Sub AEC2CableExceptions(ByVal comp As Worksheet, ByVal conn As Worksheet, ByVal out As Worksheet)
+    Dim tags As Object, conductors As Object, r As Long, t As String, wt As String, key As String
+    Set tags = CreateObject("Scripting.Dictionary"): tags.CompareMode = vbTextCompare
+    Set conductors = CreateObject("Scripting.Dictionary"): conductors.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(comp)
+        If InStr(1, UCase$(AEC2Text(comp, r, "Component Status")), "CABLE") > 0 Then
+            t = AEC2Text(comp, r, "Tag")
+            If t <> "" Then If tags.Exists(t) Then AEC2Add out, "Cable Exception", "ERROR", "FLAG", cable:=t, msg:="Cable tag appears more than once.", basis:="Duplicate cable master rows." Else tags.Add t, r
+        End If
+    Next r
+    For r = 2 To AEC2Last(conn)
+        t = AEC2Text(conn, r, "Cable"): wt = AEC2Text(conn, r, "Wire Type")
+        If t <> "" And wt <> "" Then
+            key = UCase$(t & "|" & wt)
+            If conductors.Exists(key) Then AEC2Add out, "Cable Exception", "WARNING", "POSSIBLE", cable:=t, style:=wt, msg:="Color/gauge repeats within cable.", basis:="Repeated Cable + Wire Type; verify intentional shield/conductor use." Else conductors.Add key, r
+        End If
+    Next r
+    AEC2Add out, "Cable Exception", "INFO", "LIMITED", msg:="Consolidation can hide duplicate cable symbols.", basis:="Exact duplicate-tag detection needs unconsolidated cable assignments."
+End Sub
+
+Private Sub AEC2NoCatalog(ByVal ws As Worksheet, ByVal out As Worksheet)
+    Dim r As Long, t As String
+    For r = 2 To AEC2Last(ws)
+        t = AEC2Text(ws, r, "Tag")
+        If t <> "" And Not AEC2Terminal(ws, r) And AEC2Text(ws, r, "Catalog Number") = "" Then AEC2Add out, "Component - No Catalog Number", "ERROR", "FLAG", tag:=t, cat:=AEC2Text(ws, r, "Category"), inst:=AEC2Text(ws, r, "Installation"), loc:=AEC2Text(ws, r, "Location"), msg:="Component has no primary catalog number.", basis:="Direct Catalog Number test."
+    Next r
+End Sub
+
+Private Sub AEC2ComponentDuplicates(ByVal ws As Worksheet, ByVal out As Worksheet, ByVal mode As String)
+    Dim d As Object, r As Long, t As String, key As String
+    Set d = CreateObject("Scripting.Dictionary"): d.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(ws)
+        t = AEC2Text(ws, r, "Tag")
+        If t <> "" And Not AEC2Terminal(ws, r) Then
+            If mode = "INST_LOC" Then key = t & "|" & AEC2Text(ws, r, "Installation") & "|" & AEC2Text(ws, r, "Location") Else key = t
+            If d.Exists(key) Then AEC2Add out, "Component Duplication", "ERROR", "FLAG", tag:=t, cat:=AEC2Text(ws, r, "Category"), inst:=AEC2Text(ws, r, "Installation"), loc:=AEC2Text(ws, r, "Location"), msg:="Duplicate component identity.", basis:="Compared using selected tag mode." Else d.Add key, r
+        End If
+    Next r
+    AEC2Add out, "Component Duplication", "INFO", "LIMITED", msg:="Consolidation may hide source duplicates.", basis:="Exact checking needs unconsolidated symbol records."
+End Sub
+
+Private Sub AEC2NoComponentConnection(ByVal comp As Worksheet, ByVal conn As Worksheet, ByVal out As Worksheet)
+    Dim d As Object, r As Long, t As String
+    Set d = CreateObject("Scripting.Dictionary"): d.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(conn)
+        t = AEC2Text(conn, r, "From Component"): If t <> "" And Not AEC2Unknown(t) Then d(t) = True
+        t = AEC2Text(conn, r, "To Component"): If t <> "" And Not AEC2Unknown(t) Then d(t) = True
+    Next r
+    For r = 2 To AEC2Last(comp)
+        t = AEC2Text(comp, r, "Tag")
+        If t <> "" And Not AEC2Terminal(comp, r) And Not d.Exists(t) Then AEC2Add out, "Component - No Connection", "WARNING", "POSSIBLE", tag:=t, cat:=AEC2Text(comp, r, "Category"), inst:=AEC2Text(comp, r, "Installation"), loc:=AEC2Text(comp, r, "Location"), msg:="Component is absent from all connection endpoints.", basis:="Isolation proxy; original block pin attributes are unavailable."
+    Next r
+End Sub
+
+Private Sub AEC2TerminalDuplicates(ByVal ws As Worksheet, ByVal out As Worksheet)
+    Dim d As Object, r As Long, s As String, n As String, key As String
+    Set d = CreateObject("Scripting.Dictionary"): d.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(ws)
+        If AEC2Terminal(ws, r) Then
+            s = AEC2Text(ws, r, "Terminal Strip"): n = AEC2Text(ws, r, "Terminal Number")
+            If s <> "" And n <> "" Then
+                key = s & "|" & n
+                If d.Exists(key) Then AEC2Add out, "Terminal Duplication", "ERROR", "FLAG", strip:=s, term:=n, inst:=AEC2Text(ws, r, "Installation"), loc:=AEC2Text(ws, r, "Location"), msg:="Duplicate terminal number on the same strip.", basis:="WDN exclusions are unavailable." Else d.Add key, r
+            End If
+        End If
+    Next r
+End Sub
+
+Private Sub AEC2PinExceptions(ByVal ws As Worksheet, ByVal out As Worksheet)
+    Dim d As Object, r As Long
+    Set d = CreateObject("Scripting.Dictionary"): d.CompareMode = vbTextCompare
+    For r = 2 To AEC2Last(ws)
+        AEC2PinSide ws, out, d, r, True
+        AEC2PinSide ws, out, d, r, False
+    Next r
+End Sub
+
+Private Sub AEC2PinSide(ByVal ws As Worksheet, ByVal out As Worksheet, ByVal d As Object, ByVal r As Long, ByVal fromSide As Boolean)
+    Dim inst As String, loc As String, tag As String, pin As String, peer As String, key As String
+    If fromSide Then
+        inst = AEC2Text(ws, r, "From Installation"): loc = AEC2Text(ws, r, "From Location"): tag = AEC2Text(ws, r, "From Component"): pin = AEC2Text(ws, r, "From Pin")
+        peer = AEC2Endpoint(AEC2Text(ws, r, "To Installation"), AEC2Text(ws, r, "To Location"), AEC2Text(ws, r, "To Component"), AEC2Text(ws, r, "To Pin"))
+    Else
+        inst = AEC2Text(ws, r, "To Installation"): loc = AEC2Text(ws, r, "To Location"): tag = AEC2Text(ws, r, "To Component"): pin = AEC2Text(ws, r, "To Pin")
+        peer = AEC2Endpoint(AEC2Text(ws, r, "From Installation"), AEC2Text(ws, r, "From Location"), AEC2Text(ws, r, "From Component"), AEC2Text(ws, r, "From Pin"))
+    End If
+    If tag = "" Or pin = "" Or AEC2Unknown(tag) Then Exit Sub
+    key = AEC2Endpoint(inst, loc, tag, pin)
+    If d.Exists(key) Then
+        If StrComp(CStr(d(key)), peer, vbTextCompare) <> 0 Then AEC2Add out, "Pin Exception", "WARNING", "POSSIBLE", wire:=AEC2Text(ws, r, "Wire Number"), tag:=tag, pin:=pin, inst:=inst, loc:=loc, msg:="Same component pin has more than one peer endpoint.", basis:="A legitimate network branch can also repeat a pin in pairwise rows."
+    Else
+        d.Add key, peer
+    End If
+End Sub
+
+Private Sub AEC2Format(ByVal ws As Worksheet)
+    Dim r As Long, lastR As Long, v As String
+    With ws.Rows(1): .Font.Bold = True: .Font.color = vbWhite: .Interior.color = RGB(31, 78, 121): End With
+    ws.Range("A1:Q1").AutoFilter
+    ws.Columns("A:Q").AutoFit
+    ws.Columns("P:Q").ColumnWidth = 58
+    ws.Columns("P:Q").WrapText = True
+    lastR = AEC2Last(ws)
+    For r = 2 To lastR
+        v = UCase$(AEC2Text(ws, r, "Result"))
+        If v = "FLAG" Then ws.Rows(r).Interior.color = RGB(255, 199, 206)
+        If v = "POSSIBLE" Then ws.Rows(r).Interior.color = RGB(255, 235, 156)
+        If v = "LIMITED" Then ws.Rows(r).Interior.color = RGB(221, 235, 247)
+    Next r
+    ws.Activate
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.SplitRow = 1
+    ActiveWindow.FreezePanes = True
+End Sub
+
+
